@@ -28,36 +28,51 @@ transform = transforms.Compose([
 ])
 
 def classify_image(image):
+    print("h:",image)
+    # image = Image.open(image)
     input_tensor = transform(image).unsqueeze(0).to(device)
+    print("101:")
+
     with torch.no_grad():
+        print("102:")
+
         outputs = model(input_tensor).logits
         _, predicted_class = torch.max(outputs, 1)
+    print("103:")
+
     return predicted_class.item()
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'message': 'Welcome to the Image Classification API'})
+    image_url ='https://media.istockphoto.com/id/184276818/photo/red-apple.jpg?s=612x612&w=0&k=20&c=NvO-bLsG0DJ_7Ii8SSVoKLurzjmV0Qi4eGfn6nW3l5w='
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    predicted_class = classify_image(image)
+    return jsonify({'message': 'Welcome to the Image Classification API','predicted_class': predicted_class})
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
+        print(request)
         if 'file' in request.files:
-            image = Image.open(request.files['file'])
+            image = Image.open(request.files['file']).convert("RGB")
         elif 'url' in request.json:
             image_url = request.json['url']
             response = requests.get(image_url)
+            print("image url ->", image_url, "  <->  ", response)
             if response.status_code == 200:
-                image = Image.open(BytesIO(response.content))
+                image = Image.open(BytesIO(response.content)).convert("RGB")
             else:
                 return jsonify({'error': 'Could not fetch image from URL'}), 400
         else:
             return jsonify({'error': 'No image provided'}), 400
 
-        predicted_class = classify_image(image)
+        predicted_class = classify_image(image)  # ✅ Pass image, not URL
         return jsonify({'predicted_class': predicted_class})
+
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'})
-
+    
 @app.route('/model', methods=['POST'])
 def model_request():
     try:
@@ -71,5 +86,5 @@ def model_request():
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'})
 
-# if __name__ == '__main__':
-#     app.run(host='127.0.0.1', port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)

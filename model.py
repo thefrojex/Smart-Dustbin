@@ -17,8 +17,6 @@ def load_model(model_path):
     model.eval()
     return model, device
 
-
-
 model, device = load_model(model_path)
 
 
