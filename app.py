@@ -58,7 +58,7 @@ def predict():
             image = Image.open(request.files['file']).convert("RGB")
         elif 'url' in request.json:
             image_url = request.json['url']
-            response = requests.get(image_url)
+            response = requests.get(image_url)   
             print("image url ->", image_url, "  <->  ", response)
             if response.status_code == 200:
                 image = Image.open(BytesIO(response.content)).convert("RGB")
@@ -86,5 +86,8 @@ def model_request():
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'})
 
+# if __name__ == '__main__':
+#     app.run(host='127.0.0.1', port=5000, debug=True)
+
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)

@@ -1,0 +1,375 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "esp_camera.h"
+#include "mbedtls/sha1.h"
+#include <time.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>  // ESP32 compatible servo library
+
+//---------------------
+// Function Prototypes
+//---------------------
+void setupTime();
+void setupCamera();
+String uploadToCloudinary();
+int callModelPrediction(String imageUrl);
+float getDistance();
+void processImage();
+
+//---------------------
+// AI Thinker ESP32-CAM Pin Definitions
+//---------------------
+#define PWDN_GPIO_NUM    32
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM    26
+#define SIOC_GPIO_NUM    27
+
+#define Y9_GPIO_NUM      35
+#define Y8_GPIO_NUM      34
+#define Y7_GPIO_NUM      39
+#define Y6_GPIO_NUM      36
+#define Y5_GPIO_NUM      21
+#define Y4_GPIO_NUM      19
+#define Y3_GPIO_NUM      18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM   25
+#define HREF_GPIO_NUM    23
+#define PCLK_GPIO_NUM    22
+
+//---------------------
+// Sonar Sensor (HC-SR04) Pin Definitions
+//---------------------
+#define TRIG_PIN         4
+#define ECHO_PIN         15
+
+//---------------------
+// WiFi Credentials
+//---------------------
+// const char* ssid = "pbs";
+// const char* password = "87654321";
+const char* ssid = "red";
+const char* password = "12345678";
+
+//---------------------
+// Cloudinary Credentials
+//---------------------
+const char* cloudName = "dt01upgda";
+const char* apiKey      = "155558678853474";
+const char* apiSecret   = "Z5kofwkmYgyhDqDnxt70genrtpE";
+
+// Cloudinary upload URL
+String cloudinaryUrl = "https://api.cloudinary.com/v1_1/" + String(cloudName) + "/image/upload";
+
+//---------------------
+// Servo Setup
+//---------------------
+Servo myservo;
+const int servoPin = 13;  // Change to your servo control pin
+
+//---------------------
+// Helper: Convert raw bytes to a hex string
+//---------------------
+String bytesToHexString(const uint8_t *data, size_t len) {
+  String hexStr = "";
+  const char hexChars[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    hexStr += hexChars[(data[i] >> 4) & 0x0F];
+    hexStr += hexChars[data[i] & 0x0F];
+  }
+  return hexStr;
+}
+
+//---------------------
+// Helper: Compute SHA-1 hash of a string and return hex representation
+//---------------------
+String sha1Hash(String input) {
+  unsigned char hash[20];
+  mbedtls_sha1_context ctx;
+  mbedtls_sha1_init(&ctx);
+  mbedtls_sha1_starts(&ctx);
+  mbedtls_sha1_update(&ctx, (const unsigned char*)input.c_str(), input.length());
+  mbedtls_sha1_finish(&ctx, hash);
+  mbedtls_sha1_free(&ctx);
+  return bytesToHexString(hash, 20);
+}
+
+//---------------------
+// Setup time via NTP (required for a valid Cloudinary timestamp)
+//---------------------
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for time sync");
+  time_t now = time(nullptr);
+  while (now < 100000) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("\nTime synchronized");
+}
+
+//---------------------
+// Initialize the ESP32-CAM
+//---------------------
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel    = LEDC_CHANNEL_0;
+  config.ledc_timer      = LEDC_TIMER_0;
+  config.pin_d0          = Y2_GPIO_NUM;
+  config.pin_d1          = Y3_GPIO_NUM;
+  config.pin_d2          = Y4_GPIO_NUM;
+  config.pin_d3          = Y5_GPIO_NUM;
+  config.pin_d4          = Y6_GPIO_NUM;
+  config.pin_d5          = Y7_GPIO_NUM;
+  config.pin_d6          = Y8_GPIO_NUM;
+  config.pin_d7          = Y9_GPIO_NUM;
+  config.pin_xclk        = XCLK_GPIO_NUM;
+  config.pin_pclk        = PCLK_GPIO_NUM;
+  config.pin_vsync       = VSYNC_GPIO_NUM;
+  config.pin_href        = HREF_GPIO_NUM;
+  config.pin_sscb_sda    = SIOD_GPIO_NUM;
+  config.pin_sscb_scl    = SIOC_GPIO_NUM;
+  config.pin_pwdn        = PWDN_GPIO_NUM;
+  config.pin_reset       = RESET_GPIO_NUM;
+  config.xclk_freq_hz    = 20000000;
+  config.pixel_format    = PIXFORMAT_JPEG;
+  
+  // Choose frame size and JPEG quality
+  config.frame_size      = FRAMESIZE_UXGA;
+  config.jpeg_quality    = 12;
+  config.fb_count        = 1;
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+}
+
+//---------------------
+// Upload captured image to Cloudinary and return the secure URL
+//---------------------
+String uploadToCloudinary() {
+  // Clear any previous frame by capturing and immediately returning it
+  camera_fb_t *dummy_fb = esp_camera_fb_get();
+  if (dummy_fb) {
+    esp_camera_fb_return(dummy_fb);
+    delay(100); // small delay to allow buffer refresh
+  }
+
+  // Now capture the actual frame for upload
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return "";
+  }
+  
+  time_t now = time(nullptr);
+  String timestampStr = String((unsigned long)now);
+
+  // Build signature string: "timestamp=<TIMESTAMP><API_SECRET>"
+  String signatureData = "timestamp=" + timestampStr + apiSecret;
+  String signature = sha1Hash(signatureData);
+  Serial.println("Cloudinary Signature: " + signature);
+
+  String boundary = "----ESP32UploadBoundary";
+  String payloadStart = "";
+  payloadStart += "--" + boundary + "\r\n";
+  payloadStart += "Content-Disposition: form-data; name=\"api_key\"\r\n\r\n";
+  payloadStart += apiKey;
+  payloadStart += "\r\n";
+  
+  payloadStart += "--" + boundary + "\r\n";
+  payloadStart += "Content-Disposition: form-data; name=\"timestamp\"\r\n\r\n";
+  payloadStart += timestampStr;
+  payloadStart += "\r\n";
+  
+  payloadStart += "--" + boundary + "\r\n";
+  payloadStart += "Content-Disposition: form-data; name=\"signature\"\r\n\r\n";
+  payloadStart += signature;
+  payloadStart += "\r\n";
+  
+  payloadStart += "--" + boundary + "\r\n";
+  payloadStart += "Content-Disposition: form-data; name=\"file\"; filename=\"esp32.jpg\"\r\n";
+  payloadStart += "Content-Type: image/jpeg\r\n\r\n";
+  
+  String payloadEnd = "\r\n--" + boundary + "--\r\n";
+  size_t totalLen = payloadStart.length() + fb->len + payloadEnd.length();
+  
+  uint8_t *buffer = (uint8_t*)malloc(totalLen);
+  if (!buffer) {
+    Serial.println("Memory allocation failed");
+    esp_camera_fb_return(fb);
+    return "";
+  }
+  
+  memcpy(buffer, payloadStart.c_str(), payloadStart.length());
+  memcpy(buffer + payloadStart.length(), fb->buf, fb->len);
+  memcpy(buffer + payloadStart.length() + fb->len, payloadEnd.c_str(), payloadEnd.length());
+  
+  esp_camera_fb_return(fb);
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  
+  HTTPClient http;
+  http.begin(client, cloudinaryUrl);
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  
+  int httpResponseCode = http.POST(buffer, totalLen);
+  free(buffer);
+  
+  String imageUrl = "";
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Cloudinary response:");
+    Serial.println(response);
+    
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, response);
+    if (!error) {
+      imageUrl = doc["secure_url"].as<String>();
+      Serial.println("Image URL: " + imageUrl);
+    } else {
+      Serial.println("JSON parse error");
+    }
+  } else {
+    Serial.print("Error sending POST to Cloudinary: ");
+    Serial.println(httpResponseCode);
+  }
+  
+  http.end();
+  return imageUrl;
+}
+
+//---------------------
+// Call the model endpoint with the image URL and return predicted_class
+//---------------------
+int callModelPrediction(String imageUrl) {
+  int predicted = -1;
+  DynamicJsonDocument doc(256);
+  doc["url"] = imageUrl;
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  
+  HTTPClient http;
+  http.begin(client, "https://e929-2409-4081-9e8d-3bbc-7816-b55d-93b5-c23e.ngrok-free.app/predict");
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpCode = http.POST(jsonPayload);
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Model response:");
+    Serial.println(response);
+    
+    DynamicJsonDocument respDoc(256);
+    DeserializationError error = deserializeJson(respDoc, response);
+    if (!error) {
+      predicted = respDoc["predicted_class"].as<int>();
+      Serial.print("Predicted class: ");
+      Serial.println(predicted);
+    } else {
+      Serial.println("Error parsing model JSON");
+    }
+  } else {
+    Serial.print("Error calling model endpoint: ");
+    Serial.println(httpCode);
+  }
+  
+  http.end();
+  return predicted;
+}
+
+//---------------------
+// Main processing: Capture image, upload, predict, and control servo
+//---------------------
+void processImage() {
+  delay(1500);
+  Serial.println("Starting image processing...");
+  String imageUrl = uploadToCloudinary();
+  if (imageUrl != "") {
+    int predicted = callModelPrediction(imageUrl);
+    if (predicted == 0) {
+      Serial.println("Biodegradable (0): Moving servo to 170 degrees.");
+      myservo.write(170);
+    } else if (predicted == 1) {
+      Serial.println("Non-biodegradable (1): Moving servo to 10 degrees.");
+      myservo.write(10);
+    } else {
+      Serial.println("Invalid prediction received.");
+      return;
+    }
+    // Wait 5 seconds then return servo to 90 (or 80) degrees.
+    delay(5000);
+    Serial.println("Returning servo to 80 degrees.");
+    myservo.write(80);
+  } else {
+    Serial.println("Image upload failed. Skipping model call.");
+  }
+}
+
+//---------------------
+// Check distance using sonar sensor
+//---------------------
+float getDistance() {
+  long duration;
+  float distance;
+  // Trigger sonar sensor
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  // Read echo duration
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  distance = (duration * 0.034) / 2;
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+  return distance;
+}
+
+//---------------------
+// Loop: Check sonar sensor and process image if an object is detected
+//---------------------
+void loop() {
+  float distance = getDistance();
+  if (distance > 0 && distance < 18) {
+    Serial.println("Object detected within 7 cm. Waiting 0 seconds...");
+    processImage();
+    delay(10000); // Additional delay to avoid immediate re-triggering
+  }
+  delay(500);
+}
+
+//---------------------
+// Setup: Initialize WiFi, time, camera, sonar sensor, and servo
+//---------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+  
+  setupTime();
+  setupCamera();
+  
+  // Initialize sonar sensor pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // Attach servo and set default position
+  myservo.attach(servoPin);
+  myservo.write(80);
+}
